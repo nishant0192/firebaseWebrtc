@@ -1,85 +1,65 @@
-import React, { useEffect, useState } from "react";
-import { Text, View, TextInput, TouchableOpacity, Alert } from "react-native";
+import React, { useState, useEffect } from "react";
+import { View, TextInput, Button, Alert } from "react-native";
+import * as SecureStore from "expo-secure-store";
+import { io } from "socket.io-client";
 
-import { db } from "../firebase";
-import {
-  addDoc,
-  collection,
-  doc,
-  setDoc,
-  getDoc,
-  updateDoc,
-  onSnapshot,
-  deleteField,
-} from "firebase/firestore";
+const socket = io("http://192.168.29.16:3000"); // Replace with your server URL
 
-export default function RoomScreen({ setScreen, screens, setRoomId, roomId }) {
-  const onCallOrJoin = (screen) => {
-    if (roomId.length > 0) {
-      setScreen(screen);
+export default function RoomScreen({ setScreen, screens, setUserId }) {
+  const [localUserId, setLocalUserId] = useState("");
+  const [recipientId, setRecipientId] = useState("");
+
+  useEffect(() => {
+    loadUserId();
+  }, []);
+
+  const loadUserId = async () => {
+    const storedUserId = await SecureStore.getItemAsync("userId");
+    if (storedUserId) {
+      setLocalUserId(storedUserId);
+      setUserId(storedUserId);
+      registerUser(storedUserId);
     }
   };
 
-  //generate random room id
-  useEffect(() => {
-    const generateRandomId = () => {
-      const characters = "abcdefghijklmnopqrstuvwxyz";
-      let result = "";
-      for (let i = 0; i < 7; i++) {
-        const randomIndex = Math.floor(Math.random() * characters.length);
-        result += characters.charAt(randomIndex);
-      }
-      return setRoomId(result);
-    };
-    generateRandomId();
-  }, []);
-
-  //checks if room is existing
-  const checkMeeting = async () => {
-    if (roomId) {
-      const roomRef = doc(db, "room", roomId);
-      const roomSnapshot = await getDoc(roomRef);
-
-      // console.log(roomSnapshot.data());
-
-      if (!roomSnapshot.exists() || roomId === "") {
-        // console.log(`Room ${roomId} does not exist.`);
-        Alert.alert("Wait for your instructor to start the meeting.");
-        return;
-      } else {
-        onCallOrJoin(screens.JOIN);
-      }
+  const registerUser = async (id) => {
+    const userIdToRegister = id || localUserId;
+    if (userIdToRegister) {
+      await SecureStore.setItemAsync("userId", userIdToRegister);
+      setUserId(userIdToRegister);
+      socket.emit("register", userIdToRegister);
+      Alert.alert("Success", `Registered with User ID: ${userIdToRegister}`);
     } else {
-      Alert.alert("Provide a valid Room ID.");
+      Alert.alert("Error", "Please enter a User ID");
+    }
+  };
+
+  const initiateCall = () => {
+    if (recipientId) {
+      socket.emit("call-user", { callerId: localUserId, recipientId });
+      setScreen(screens.CALL);
+    } else {
+      Alert.alert("Error", "Please enter a Recipient ID");
     }
   };
 
   return (
-    <View>
-      <Text className="text-2xl font-bold text-center">Enter Room ID:</Text>
+    <View className="flex-1 justify-center items-center">
       <TextInput
-        className="bg-white border-sky-600 border-2 mx-5 my-3 p-2 rounded-md"
-        value={roomId}
-        onChangeText={setRoomId}
+        placeholder="Your User ID"
+        value={localUserId}
+        onChangeText={setLocalUserId}
+        className="border border-gray-300 p-2 mb-4 w-80"
       />
-      <View className="gap-y-3 mx-5 mt-2">
-        <TouchableOpacity
-          className="bg-sky-300 p-2  rounded-md"
-          onPress={() => onCallOrJoin(screens.CALL)}
-        >
-          <Text className="color-black text-center text-xl font-bold ">
-            Start meeting
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          className="bg-sky-300 p-2 rounded-md"
-          onPress={() => checkMeeting()}
-        >
-          <Text className="color-black text-center text-xl font-bold ">
-            Join meeting
-          </Text>
-        </TouchableOpacity>
-      </View>
+      <Button title="Register User ID" onPress={() => registerUser()} />
+
+      <TextInput
+        placeholder="Recipient User ID"
+        value={recipientId}
+        onChangeText={setRecipientId}
+        className="border border-gray-300 p-2 my-4 w-80"
+      />
+      <Button title="Initiate Call" onPress={initiateCall} />
     </View>
   );
 }

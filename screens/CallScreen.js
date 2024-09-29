@@ -1,27 +1,17 @@
-import React, { useState, useEffect } from "react";
-import { Text, StyleSheet, Button, View } from "react-native";
-
+import React, { useState, useEffect, useRef } from "react";
+import { View, Alert } from "react-native";
 import {
   RTCPeerConnection,
   RTCView,
   mediaDevices,
   RTCIceCandidate,
   RTCSessionDescription,
-  MediaStream,
 } from "react-native-webrtc";
-import { db } from "../firebase";
-import {
-  addDoc,
-  collection,
-  doc,
-  setDoc,
-  getDoc,
-  updateDoc,
-  onSnapshot,
-  deleteField,
-} from "firebase/firestore";
-
+import { io } from "socket.io-client";
 import CallActionBox from "../components/CallActionBox";
+import * as SecureStore from "expo-secure-store";
+
+const socket = io("http://192.168.29.16:3000"); // Replace with your server URL
 
 const configuration = {
   iceServers: [
@@ -29,138 +19,126 @@ const configuration = {
       urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"],
     },
   ],
-  iceCandidatePoolSize: 10,
 };
 
-export default function CallScreen({ roomId, screens, setScreen }) {
-  const [localStream, setLocalStream] = useState();
-  const [remoteStream, setRemoteStream] = useState();
-  const [cachedLocalPC, setCachedLocalPC] = useState();
-
+export default function CallScreen({ setScreen, screens }) {
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
   const [isMuted, setIsMuted] = useState(false);
   const [isOffCam, setIsOffCam] = useState(false);
+  const [userId, setUserId] = useState("");
+  const peerConnection = useRef(null);
 
   useEffect(() => {
+    loadUserId();
     startLocalStream();
+    setupSocketListeners();
+
+    return () => {
+      if (localStream) {
+        localStream.getTracks().forEach((track) => track.stop());
+      }
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
+    };
   }, []);
 
-  useEffect(() => {
-    if (localStream && roomId) {
-      startCall(roomId);
+  const loadUserId = async () => {
+    const storedUserId = await SecureStore.getItemAsync("userId");
+    if (storedUserId) {
+      setUserId(storedUserId);
     }
-  }, [localStream, roomId]);
-
-  //End call button
-  async function endCall() {
-    if (cachedLocalPC) {
-      const senders = cachedLocalPC.getSenders();
-      senders.forEach((sender) => {
-        cachedLocalPC.removeTrack(sender);
-      });
-      cachedLocalPC.close();
-    }
-
-    const roomRef = doc(db, "room", roomId);
-    await updateDoc(roomRef, { answer: deleteField() });
-
-    setLocalStream();
-    setRemoteStream(); // set remoteStream to null or empty when callee leaves the call
-    setCachedLocalPC();
-    // cleanup
-    setScreen(screens.ROOM); //go back to room screen
-  }
-
-  //start local webcam on your device
-  const startLocalStream = async () => {
-    // isFront will determine if the initial camera should face user or environment
-    const isFront = true;
-    const devices = await mediaDevices.enumerateDevices();
-
-    const facing = isFront ? "front" : "environment";
-    const videoSourceId = devices.find(
-      (device) => device.kind === "videoinput" && device.facing === facing
-    );
-    const facingMode = isFront ? "user" : "environment";
-    const constraints = {
-      audio: true,
-      video: {
-        mandatory: {
-          minWidth: 500, // Provide your own width, height and frame rate here
-          minHeight: 300,
-          minFrameRate: 30,
-        },
-        facingMode,
-        optional: videoSourceId ? [{ sourceId: videoSourceId }] : [],
-      },
-    };
-    const newStream = await mediaDevices.getUserMedia(constraints);
-    setLocalStream(newStream);
   };
 
-  const startCall = async (id) => {
-    const localPC = new RTCPeerConnection(configuration);
-    localStream.getTracks().forEach((track) => {
-      localPC.addTrack(track, localStream);
+  const setupSocketListeners = () => {
+    socket.on("incoming-call", async ({ callerId, offer }) => {
+      Alert.alert("Incoming Call", `Call from ${callerId}`, [
+        {
+          text: "Decline",
+          onPress: () => socket.emit("call-declined", { callerId }),
+          style: "cancel",
+        },
+        {
+          text: "Accept",
+          onPress: () => handleIncomingCall(callerId, offer),
+        },
+      ]);
     });
 
-    const roomRef = doc(db, "room", id);
-    const callerCandidatesCollection = collection(roomRef, "callerCandidates");
-    const calleeCandidatesCollection = collection(roomRef, "calleeCandidates");
+    socket.on("call-answered", ({ answer }) => {
+      handleCallAnswered(answer);
+    });
 
-    localPC.addEventListener("icecandidate", (e) => {
-      if (!e.candidate) {
-        console.log("Got final candidate!");
-        return;
+    socket.on("ice-candidate", handleNewICECandidate);
+  };
+
+  const startLocalStream = async () => {
+    const stream = await mediaDevices.getUserMedia({
+      audio: true,
+      video: true,
+    });
+    setLocalStream(stream);
+  };
+
+  const handleIncomingCall = async (callerId, offer) => {
+    peerConnection.current = new RTCPeerConnection(configuration);
+    peerConnection.current.ontrack = handleTrackEvent;
+    peerConnection.current.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit("ice-candidate", {
+          recipientId: callerId,
+          candidate: event.candidate,
+        });
       }
-      addDoc(callerCandidatesCollection, e.candidate.toJSON());
-    });
-
-    localPC.ontrack = (e) => {
-      const newStream = new MediaStream();
-      e.streams[0].getTracks().forEach((track) => {
-        newStream.addTrack(track);
-      });
-      setRemoteStream(newStream);
     };
 
-    const offer = await localPC.createOffer();
-    await localPC.setLocalDescription(offer);
+    await peerConnection.current.setRemoteDescription(
+      new RTCSessionDescription(offer)
+    );
 
-    await setDoc(roomRef, { offer, connected: false }, { merge: true });
+    localStream
+      .getTracks()
+      .forEach((track) => peerConnection.current.addTrack(track, localStream));
 
-    // Listen for remote answer
-    onSnapshot(roomRef, (doc) => {
-      const data = doc.data();
-      if (!localPC.currentRemoteDescription && data.answer) {
-        const rtcSessionDescription = new RTCSessionDescription(data.answer);
-        localPC.setRemoteDescription(rtcSessionDescription);
-      } else {
-        setRemoteStream();
-      }
-    });
+    const answer = await peerConnection.current.createAnswer();
+    await peerConnection.current.setLocalDescription(answer);
 
-    // when answered, add candidate to peer connection
-    onSnapshot(calleeCandidatesCollection, (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === "added") {
-          let data = change.doc.data();
-          localPC.addIceCandidate(new RTCIceCandidate(data));
-        }
-      });
-    });
+    socket.emit("answer-call", { callerId, answer });
+  };
 
-    setCachedLocalPC(localPC);
+  const handleCallAnswered = async (answer) => {
+    await peerConnection.current.setRemoteDescription(
+      new RTCSessionDescription(answer)
+    );
+  };
+
+  const handleNewICECandidate = async (candidate) => {
+    if (peerConnection.current) {
+      await peerConnection.current.addIceCandidate(
+        new RTCIceCandidate(candidate)
+      );
+    }
+  };
+
+  const handleTrackEvent = (event) => {
+    setRemoteStream(event.streams[0]);
+  };
+
+  const endCall = () => {
+    if (peerConnection.current) {
+      peerConnection.current.close();
+    }
+    setLocalStream(null);
+    setRemoteStream(null);
+    setScreen(screens.ROOM);
   };
 
   const switchCamera = () => {
     localStream.getVideoTracks().forEach((track) => track._switchCamera());
   };
 
-  // Mutes the local's outgoing audio
   const toggleMute = () => {
-    if (!remoteStream) {
-      return;
-    }
     localStream.getAudioTracks().forEach((track) => {
       track.enabled = !track.enabled;
       setIsMuted(!track.enabled);
@@ -170,43 +148,27 @@ export default function CallScreen({ roomId, screens, setScreen }) {
   const toggleCamera = () => {
     localStream.getVideoTracks().forEach((track) => {
       track.enabled = !track.enabled;
-      setIsOffCam(!isOffCam);
+      setIsOffCam(!track.enabled);
     });
   };
 
   return (
-    <View className="flex-1 bg-red-600">
-      {!remoteStream && (
+    <View className="flex-1 bg-black">
+      {localStream && (
         <RTCView
-          className="flex-1"
-          streamURL={localStream && localStream.toURL()}
-          objectFit={"cover"}
+          streamURL={localStream.toURL()}
+          className="absolute top-0 right-0 w-1/3 h-1/3"
         />
       )}
-
       {remoteStream && (
-        <>
-          <RTCView
-            className="flex-1"
-            streamURL={remoteStream && remoteStream.toURL()}
-            objectFit={"cover"}
-          />
-          {!isOffCam && (
-            <RTCView
-              className="w-32 h-48 absolute right-6 top-8"
-              streamURL={localStream && localStream.toURL()}
-            />
-          )}
-        </>
+        <RTCView streamURL={remoteStream.toURL()} className="flex-1" />
       )}
-      <View className="absolute bottom-0 w-full">
-        <CallActionBox
-          switchCamera={switchCamera}
-          toggleMute={toggleMute}
-          toggleCamera={toggleCamera}
-          endCall={endCall}
-        />
-      </View>
+      <CallActionBox
+        switchCamera={switchCamera}
+        toggleMute={toggleMute}
+        toggleCamera={toggleCamera}
+        endCall={endCall}
+      />
     </View>
   );
 }
