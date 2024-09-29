@@ -1,20 +1,19 @@
 import React, { useEffect, useRef, useState } from "react";
 import { View, Button, Text, TextInput, StyleSheet } from "react-native";
-import { RTCPeerConnection, RTCView, mediaDevices } from "react-native-webrtc";
 import { initializeApp } from "firebase/app";
+import { getDatabase, ref, onValue, set, remove } from "firebase/database";
 import {
-  initializeFirestore,
-  collection,
-  doc,
-  onSnapshot,
-  setDoc,
-  deleteDoc,
-} from "firebase/firestore";
+  RTCPeerConnection,
+  RTCView,
+  mediaDevices,
+  RTCSessionDescription,
+} from "react-native-webrtc";
 
-// Your Firebase configuration
+// Initialize Firebase
 const firebaseConfig = {
   apiKey: "AIzaSyAbzUhLgsrVhewJ_0dws0xdYedXRFcWIrE",
   authDomain: "example-53d49.firebaseapp.com",
+  databaseURL: "https://example-53d49-default-rtdb.firebaseio.com/",
   projectId: "example-53d49",
   storageBucket: "example-53d49.appspot.com",
   messagingSenderId: "266292868410",
@@ -22,78 +21,70 @@ const firebaseConfig = {
   measurementId: "G-LPK0J8Z6ZV",
 };
 
+// Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const db = initializeFirestore(app, {
-  experimentalForceLongPolling: true,
-});
+const db = getDatabase(app);
 
 const App = () => {
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
-  const [isCallActive, setIsCallActive] = useState(false);
   const [incomingCall, setIncomingCall] = useState(false);
-  const [callerSocketId, setCallerSocketId] = useState("");
+  const [userId, setUserId] = useState("");
+  const [callerUserId, setCallerUserId] = useState("");
   const peerConnection = useRef(new RTCPeerConnection({ iceServers: [] }));
 
   useEffect(() => {
     const getUserMedia = async () => {
-      const stream = await mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-      setLocalStream(stream);
-      stream
-        .getTracks()
-        .forEach((track) => peerConnection.current.addTrack(track, stream));
+      try {
+        const stream = await mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        setLocalStream(stream);
+        stream
+          .getTracks()
+          .forEach((track) => peerConnection.current.addTrack(track, stream));
+      } catch (error) {
+        console.error("Error accessing media devices.", error);
+      }
     };
 
     getUserMedia();
 
-    const callCollection = collection(db, "calls");
-
-    // Listen for incoming calls
-    const unsubscribe = onSnapshot(callCollection, (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === "added") {
-          const data = change.doc.data();
-          if (data.callStatus === "incoming") {
-            setIncomingCall(true);
-            setCallerSocketId(data.callerId);
-            peerConnection.current.setRemoteDescription(
-              new RTCSessionDescription(data.signal)
-            );
-          }
-        } else if (change.type === "removed") {
-          setIncomingCall(false);
+    // Listen for signaling messages
+    const callRef = ref(db, "calls/");
+    onValue(callRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data && data[userId]) {
+        const callData = data[userId];
+        if (callData.offer) {
+          handleIncomingCall(callData);
         }
-      });
+      }
     });
 
-    peerConnection.current.ontrack = (event) => {
-      setRemoteStream(event.streams[0]);
-    };
-
-    peerConnection.current.onicecandidate = (event) => {
-      if (event.candidate) {
-        setDoc(doc(callCollection, callerSocketId), {
-          candidate: event.candidate,
-          callStatus: "ongoing",
-        });
-      }
-    };
-
     return () => {
-      unsubscribe();
+      remove(callRef);
     };
-  }, [callerSocketId]);
+  }, [userId]);
+
+  const handleIncomingCall = async (callData) => {
+    console.log("Incoming call from:", callData.from);
+    setIncomingCall(true);
+    setCallerUserId(callData.from);
+    await peerConnection.current.setRemoteDescription(
+      new RTCSessionDescription(callData.offer)
+    );
+  };
 
   const startCall = async (to) => {
     const offer = await peerConnection.current.createOffer();
     await peerConnection.current.setLocalDescription(offer);
-    await setDoc(doc(collection(db, "calls"), to), {
-      signal: offer,
-      callerId: callerSocketId,
-      callStatus: "incoming",
+
+    // Save call data to Firebase
+    set(ref(db, `calls/${to}`), {
+      offer: offer,
+      from: userId,
     });
   };
 
@@ -101,39 +92,47 @@ const App = () => {
     setIncomingCall(false);
     const answer = await peerConnection.current.createAnswer();
     await peerConnection.current.setLocalDescription(answer);
-    await setDoc(doc(collection(db, "calls"), callerSocketId), {
-      signal: answer,
-      callStatus: "ongoing",
+
+    // Save answer to Firebase
+    set(ref(db, `calls/${callerUserId}`), {
+      answer: answer,
+      from: userId,
     });
   };
 
-  const declineCall = async () => {
+  const declineCall = () => {
     setIncomingCall(false);
-    await deleteDoc(doc(collection(db, "calls"), callerSocketId));
+    remove(ref(db, `calls/${callerUserId}`));
   };
 
   return (
     <View style={styles.container}>
       {localStream && (
-        <RTCView style={styles.video} streamURL={localStream.toURL()} />
+        <RTCView style={styles.localVideo} streamURL={localStream.toURL()} />
       )}
-      {isCallActive && remoteStream && (
-        <RTCView style={styles.video} streamURL={remoteStream.toURL()} />
+      {remoteStream && (
+        <RTCView style={styles.remoteVideo} streamURL={remoteStream.toURL()} />
       )}
       {incomingCall && (
         <View style={styles.callContainer}>
-          <Text>Incoming Call</Text>
+          <Text>Incoming Call from {callerUserId}</Text>
           <Button title="Accept" onPress={acceptCall} />
           <Button title="Decline" onPress={declineCall} />
         </View>
       )}
       <TextInput
         style={styles.input}
-        placeholder="Enter Caller Socket ID"
-        value={callerSocketId}
-        onChangeText={setCallerSocketId}
+        placeholder="Enter Your User ID"
+        value={userId}
+        onChangeText={setUserId}
       />
-      <Button title="Start Call" onPress={() => startCall(callerSocketId)} />
+      <TextInput
+        style={styles.input}
+        placeholder="Enter Caller User ID"
+        value={callerUserId}
+        onChangeText={setCallerUserId}
+      />
+      <Button title="Start Call" onPress={() => startCall(callerUserId)} />
     </View>
   );
 };
@@ -142,18 +141,25 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     justifyContent: "center",
+    width: "100%",
     alignItems: "center",
   },
-  video: {
+  localVideo: {
     width: "100%",
-    height: "80%",
+    height: "40%",
+  },
+  remoteVideo: {
+    width: "100%",
+    height: "40%",
+    position: "absolute",
+    top: 0,
   },
   callContainer: {
     position: "absolute",
-    top: "40%",
+    top: "10%",
     left: "50%",
     transform: [{ translateX: -50 }, { translateY: -50 }],
-    backgroundColor: "white",
+    backgroundColor: "rgba(255, 255, 255, 0.8)",
     padding: 20,
     borderRadius: 10,
     alignItems: "center",

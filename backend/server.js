@@ -14,42 +14,38 @@ const io = socketIo(server, {
 
 app.use(cors());
 
-// Function to generate a random 3-character ID
-const generateRandomId = () => {
-  const characters =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  for (let i = 0; i < 3; i++) {
-    result += characters.charAt(Math.floor(Math.random() * characters.length));
-  }
-  return result;
-};
-
 io.on("connection", (socket) => {
-  // Assign a random 3-character ID to the user
-  const userId = generateRandomId();
-  console.log("New user connected: " + userId);
+  console.log("New user connected: " + socket.id);
+
+  // Handle user registration
+  socket.on("register", (userId) => {
+    socket.userId = userId; // Store userId in socket
+    console.log(`User registered: ${userId}`);
+  });
 
   // Handle call request
   socket.on("call-user", (data) => {
+    console.log(`Calling user: ${data.to} from ${data.from}`);
     io.to(data.to).emit("call-made", {
       signal: data.signal,
-      socket: userId,
+      from: data.from,
     });
   });
 
   // Handle answer call
   socket.on("accept-call", (data) => {
+    console.log(`Call accepted by: ${data.to}`);
     io.to(data.to).emit("call-accepted", {
-      from: userId,
       signal: data.signal,
+      from: socket.userId, // Use the stored userId
     });
   });
 
   // Handle decline call
   socket.on("decline-call", (data) => {
+    console.log(`Call declined by: ${socket.userId}`);
     io.to(data.to).emit("call-declined", {
-      from: userId,
+      from: socket.userId,
     });
   });
 
@@ -57,13 +53,13 @@ io.on("connection", (socket) => {
   socket.on("send-candidate", (data) => {
     io.to(data.to).emit("receive-candidate", {
       candidate: data.candidate,
-      socket: userId,
+      from: socket.userId,
     });
   });
 
   // Clean up when a user disconnects
   socket.on("disconnect", () => {
-    console.log("User disconnected: " + userId);
+    console.log("User disconnected: " + socket.userId);
   });
 });
 
